@@ -13,6 +13,7 @@ import type { NotificationPayload } from "@/core/kernel/messages";
 import type {
   ListPackagesResponse,
   PackageOperationResponse,
+  NotebookDocumentTransactionRequest,
   SaveNotebookRequest,
 } from "@/core/network/types";
 import type { JsonString } from "@/utils/json/base64";
@@ -85,7 +86,14 @@ let started = false;
 const notebookSubscriptions = new Map<string, Promise<void>>();
 async function getNotebook() {
   const bridge = await bridgeReady.promise;
-  return bridge.notebook;
+  const notebook = bridge.notebook;
+  notebook.set_persistence(async (contents, filename) => {
+    // Keep file operations in the execution worker from syncing stale source.
+    self.pyodide.FS.writeFile(filename, contents);
+    self.pyodide.FS.writeFile(WasmFileSystem.NOTEBOOK_FILENAME, contents);
+    await rpc.proxy.request.persistNotebook({ filename, contents });
+  });
+  return notebook;
 }
 
 const requestHandler = createRPCRequestHandler({
@@ -296,13 +304,21 @@ const requestHandler = createRPCRequestHandler({
     };
   },
 
-  /**
-   * Save the notebook
-   */
-  saveNotebook: async (opts: SaveNotebookRequest) => {
-    await pyodideReadyPromise; // Make sure loading is done
-    const bridge = await bridgeReady.promise;
-    await bridge.save(JSON.stringify(opts));
+  documentTransaction: async (request: NotebookDocumentTransactionRequest) => {
+    const notebook = await getNotebook();
+    try {
+      await notebook.transaction(JSON.stringify(request));
+    } finally {
+      notebook.destroy();
+    }
+  },
+  setNotebookLayout: async (layout: SaveNotebookRequest["layout"]) => {
+    const notebook = await getNotebook();
+    try {
+      await notebook.set_layout(JSON.stringify(layout));
+    } finally {
+      notebook.destroy();
+    }
   },
 
   /**
@@ -403,6 +419,8 @@ const rpc = createRPC<WorkerSchema, ParentSchema>({
     transportId: TRANSPORT_ID,
   }),
   requestHandler,
+  // Persistence can include bootstrapping the storage worker.
+  maxRequestTime: Infinity,
 });
 
 rpc.addMessageListener("bootstrap", (config) => runtimeConfig.resolve(config));
@@ -417,8 +435,6 @@ rpc.addMessageListener("consumerReady", async () => {
 });
 
 const namesThatRequireSync = new Set<keyof RawBridge>([
-  "save",
-  "save_app_config",
   "rename_file",
   "create_file_or_directory",
   "delete_file_or_directory",
